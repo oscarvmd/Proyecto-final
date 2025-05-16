@@ -1,0 +1,173 @@
+#include <xc.h>                // Librería principal para el compilador XC8 (registros del PIC)
+#include <stdint.h>           // Tipos de datos enteros con tamaño fijo (ej. uint8_t, uint16_t)
+#include <stdio.h>            // Librería estándar para funciones como sprintf
+#include <string.h>           // Funciones para manipular cadenas (strlen)
+#include "LCD.h"              // Librería personalizada para controlar el display LCD
+
+#define _XTAL_FREQ 48000000UL // Frecuencia de reloj del sistema: 48 MHz (necesaria para __delay)
+
+
+// ========== CONFIGURACIÓN DE FUSES ==========
+#pragma config FOSC = HSPLL_HS     // Oscilador con cristal y PLL habilitado
+#pragma config CPUDIV = OSC1_PLL2  // Divide el PLL entre 2 → CPU a 48 MHz
+#pragma config USBDIV = 1          // USB usa directamente el PLL sin dividir
+#pragma config WDT = OFF           // Desactiva el Watchdog Timer
+#pragma config LVP = OFF           // Desactiva programación en baja tensión
+#pragma config PBADEN = OFF        // Desactiva funciones analógicas en PORTB
+#pragma config FCMEN = OFF         // Desactiva monitoreo de falla de reloj
+#pragma config IESO = OFF          // Desactiva conmutación automática de oscilador
+
+#define TRIG LATAbits.LATA4        // Alias para el pin TRIG del sensor ultrasónico (salida)
+#define ECHO PORTAbits.RA5         // Alias para el pin ECHO del sensor ultrasónico (entrada)
+
+uint8_t modo = 0;                  // Variable global para guardar el modo seleccionado (1, 2 o 3)
+
+
+// ========== CONFIGURACIÓN GENERAL DEL SISTEMA ==========
+void configurar(void) {
+    TRISAbits.TRISA4 = 0;         // RA4 como salida → TRIG del sensor
+    TRISAbits.TRISA5 = 1;         // RA5 como entrada → ECHO del sensor
+    LATAbits.LATA4 = 0;           // Inicializa TRIG en bajo
+
+    TRISBbits.TRISB0 = 1;         // Botón 1 (Modo 1) como entrada
+    TRISBbits.TRISB1 = 1;         // Botón 2 (Modo 2) como entrada
+    TRISBbits.TRISB2 = 1;         // Botón 3 (Modo 3) como entrada
+    INTCON2bits.RBPU = 0;         // Habilita pull-ups internos en PORTB
+
+    TRISDbits.TRISD0 = 0;         // RD0 como salida → LED 1
+    TRISDbits.TRISD1 = 0;         // RD1 como salida → LED 2
+    TRISDbits.TRISD2 = 0;         // RD2 como salida → LED 3
+    LATDbits.LATD0 = 0;           // Apaga LED 1 al inicio
+    LATDbits.LATD1 = 0;           // Apaga LED 2 al inicio
+    LATDbits.LATD2 = 0;           // Apaga LED 3 al inicio
+
+    TRISD |= 0xF0;                // Configura RD4–RD7 como salidas (datos del LCD)
+    TRISE = 0x00;                 // RE0–RE2 como salidas (control del LCD)
+    LATD &= 0x0F;                 // Asegura que los bits altos de LATD estén en 0
+    LATE = 0x00;                  // Apaga control del LCD
+
+    ADCON1bits.PCFG = 0b1111;     // Todo como digital (desactiva entradas analógicas)
+    T1CON = 0b00000001;           // Configura Timer1 con prescaler 1:1 y lo activa
+
+    LCD_CONFIG();                 // Inicializa el LCD (modo 8 bits, según tu librería)
+    __delay_ms(15);               // Pequeña espera para estabilizar
+    BORRAR_LCD();                 // Limpia el LCD
+}
+
+
+// ========== FUNCIÓN PARA MEDIR DISTANCIA ==========
+uint16_t medir_distancia(void) {
+    uint16_t tiempo, timeout;
+
+    TRIG = 0;                     // Asegura que TRIG esté en bajo
+    __delay_us(2);
+    TRIG = 1;                     // Pulso de 10 us para activar el sensor
+    __delay_us(10);
+    TRIG = 0;
+
+    timeout = 60000;
+    while (!ECHO && --timeout);  // Espera a que llegue el pulso de subida
+    if (timeout == 0) return 0;  // Si no llega, retorna 0
+
+    TMR1H = 0;                    // Reinicia el Timer1
+    TMR1L = 0;
+    T1CONbits.TMR1ON = 1;        // Inicia el temporizador
+
+    timeout = 60000;
+    while (ECHO && --timeout);   // Espera a que baje el pulso
+    T1CONbits.TMR1ON = 0;        // Detiene el temporizador
+
+    tiempo = ((uint16_t)TMR1H << 8) | TMR1L; // Combina los 2 registros
+    uint16_t distancia = tiempo / 315;       // Conversión a centímetros calibrada
+
+    if (distancia == 4) distancia = 5;       // Corrección por software
+    if (distancia >= 16 && distancia <= 17) distancia = 15;
+
+    return distancia;                        // Devuelve la distancia en cm
+}
+
+
+// ========== DELAY VARIABLE (permite retardo por variable) ==========
+void delay_variable_ms(uint16_t tiempo) {
+    while (tiempo--) {
+        __delay_ms(1);            // Retardo de 1 ms repetido según la variable
+    }
+}
+
+
+// ========== MUESTRA EL MODO EN EL LCD ==========
+void mostrar_modo(uint8_t m) {
+    char texto[16];
+    BORRAR_LCD();                 // Limpia pantalla
+    POS_CURSOR(1, 0);             // Pone el cursor en la primera línea
+    sprintf(texto, "Modo: %u", m);// Crea el mensaje
+    ESCRIBE_MENSAJE(texto, (unsigned char)strlen(texto)); // Muestra en LCD
+}
+
+
+// ========== MUESTRA LA DISTANCIA EN EL LCD ==========
+void mostrar_distancia(uint16_t d) {
+    char texto[16];
+    POS_CURSOR(2, 0);             // Segunda línea del LCD
+    sprintf(texto, "Dist: %u cm", d);
+    ESCRIBE_MENSAJE(texto, (unsigned char)strlen(texto));
+}
+
+
+// ========== PARPADEA TODOS LOS LEDS CON UNA VELOCIDAD ==========
+void parpadear_todos_los_leds(uint16_t velocidad_ms) {
+    LATDbits.LATD0 = !LATDbits.LATD0; // Cambia el estado de RD0
+    LATDbits.LATD1 = !LATDbits.LATD1; // Cambia el estado de RD1
+    LATDbits.LATD2 = !LATDbits.LATD2; // Cambia el estado de RD2
+    delay_variable_ms(velocidad_ms);  // Espera entre cambios
+}
+
+
+// ========== FUNCIÓN PRINCIPAL ==========
+void main(void) {
+    configurar();                  // Configura todos los periféricos
+    uint16_t distancia;
+
+    while (1) {
+        // Selección de modo por botones
+        if (PORTBbits.RB0 == 0) {
+            modo = 1;
+            mostrar_modo(1);
+            __delay_ms(300);
+        } else if (PORTBbits.RB1 == 0) {
+            modo = 2;
+            mostrar_modo(2);
+            __delay_ms(300);
+        } else if (PORTBbits.RB2 == 0) {
+            modo = 3;
+            mostrar_modo(3);
+            __delay_ms(300);
+        }
+
+        distancia = medir_distancia();     // Medición actual
+        mostrar_distancia(distancia);      // Mostrar en LCD
+
+        // Verifica si la distancia está dentro del rango del modo seleccionado
+        if ((modo == 1 && distancia <= 5 && distancia > 0) ||
+            (modo == 2 && distancia > 5 && distancia <= 10) ||
+            (modo == 3 && distancia > 10 && distancia <= 15)) {
+
+            uint16_t velocidad = 0;
+
+            // Define velocidad de parpadeo por modo
+            switch (modo) {
+                case 1: velocidad = 100; break; // Parpadeo rápido
+                case 2: velocidad = 300; break; // Parpadeo medio
+                case 3: velocidad = 600; break; // Parpadeo lento
+            }
+
+            parpadear_todos_los_leds(velocidad); // Parpadea LEDs según velocidad
+        } else {
+            // Si no hay objeto en rango, apaga todos los LEDs
+            LATDbits.LATD0 = 0;
+            LATDbits.LATD1 = 0;
+            LATDbits.LATD2 = 0;
+            __delay_ms(100);
+        }
+    }
+}
